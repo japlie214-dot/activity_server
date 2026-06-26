@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from db.turso import TursoConnection
 from db.cloud import CloudConnection
@@ -214,5 +215,4 @@ class Server:
         log.info("Shutdown complete.")
 
 
-# Need Path for ARTIFACTS_DIR
-from pathlib import Path
+

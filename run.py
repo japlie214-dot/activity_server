@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import aiohttp.web
 
-from server.config.loader import HOST, PORT
+from server.config.loader import HOST, PORT, PLATFORM
 from tools import load_all_tools
 from server.app import create_app
 
@@ -67,17 +67,23 @@ def main():
     log.info(f"  Long poll: up to 1 hour timeout")
     log.info(f"  Observability: X-Observe: true header")
 
+    # Wait for shutdown — Windows-compatible (no add_signal_handler)
     shutdown_event = asyncio.Event()
-    def _sig():
-        log.info("Signal received, shutting down...")
-        shutdown_event.set()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _sig)
+
+    if PLATFORM != "windows":
+        # POSIX: use native signal handlers in the event loop
+        def _sig():
+            log.info("Signal received, shutting down...")
+            shutdown_event.set()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _sig)
 
     try:
         loop.run_until_complete(shutdown_event.wait())
     except KeyboardInterrupt:
-        pass
+        # On Windows, Ctrl+C raises KeyboardInterrupt in the main thread.
+        # On POSIX, the signal handler sets shutdown_event before this fires.
+        log.info("KeyboardInterrupt — shutting down...")
     finally:
         loop.run_until_complete(server.shutdown())
         loop.run_until_complete(runner.cleanup())
