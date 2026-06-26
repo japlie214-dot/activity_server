@@ -1,14 +1,19 @@
 # tools/stock_financials/models.py
-from typing import Annotated, Literal, Union, Optional, Dict, Any
+"""Pydantic models for stock_financials input validation."""
+from typing import Any, Dict, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
+
 
 class ExtractInstructions(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=10)
     quarters: int = Field(default=8, ge=1, le=40)
     refresh: bool = Field(default=False)
+
     @field_validator("ticker")
     @classmethod
-    def normalize_ticker(cls, v: str) -> str: return v.upper().strip()
+    def normalize_ticker(cls, v: str) -> str:
+        return v.upper().strip()
+
 
 class QueryInstructions(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=10)
@@ -17,38 +22,44 @@ class QueryInstructions(BaseModel):
     start_quarter: Optional[str] = None
     end_quarter: Optional[str] = None
     limit: int = Field(default=100, ge=1, le=500)
+
     @field_validator("ticker")
     @classmethod
-    def normalize_ticker(cls, v: str) -> str: return v.upper().strip()
+    def normalize_ticker(cls, v: str) -> str:
+        return v.upper().strip()
+
 
 class StatusInstructions(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=10)
+
     @field_validator("ticker")
     @classmethod
-    def normalize_ticker(cls, v: str) -> str: return v.upper().strip()
+    def normalize_ticker(cls, v: str) -> str:
+        return v.upper().strip()
+
 
 class CatalogInstructions(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=10)
     statement_type: Optional[Literal["income", "balance", "cashflow"]] = None
+
     @field_validator("ticker")
     @classmethod
-    def normalize_ticker(cls, v: str) -> str: return v.upper().strip()
+    def normalize_ticker(cls, v: str) -> str:
+        return v.upper().strip()
 
-InstructionsUnion = Annotated[
-    Union[ExtractInstructions, QueryInstructions, StatusInstructions, CatalogInstructions],
-    Field(discriminator="command")
-]
 
 class StockFinancialsInput(BaseModel):
     command: Literal["extract", "query", "status", "catalog"]
     instructions: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-    @model_validator(mode='before')
+    @model_validator(mode="before")
     @classmethod
     def handle_legacy_flat(cls, data: Any) -> Any:
-        if not isinstance(data, dict): return data
+        if not isinstance(data, dict):
+            return data
         instructions = data.get("instructions") or {}
-        legacy_keys = ["ticker", "quarters", "refresh", "statement_type", "concept", "start_quarter", "end_quarter", "limit"]
+        legacy_keys = ["ticker", "quarters", "refresh", "statement_type", "concept",
+                       "start_quarter", "end_quarter", "limit"]
         for k in legacy_keys:
             if k in data and k not in instructions:
                 instructions[k] = data[k]
@@ -57,11 +68,16 @@ class StockFinancialsInput(BaseModel):
 
     def resolved_instructions(self):
         data = dict(self.instructions or {})
-        if self.command == "extract": return ExtractInstructions.model_validate(data)
-        if self.command == "query": return QueryInstructions.model_validate(data)
-        if self.command == "status": return StatusInstructions.model_validate(data)
-        if self.command == "catalog": return CatalogInstructions.model_validate(data)
+        if self.command == "extract":
+            return ExtractInstructions.model_validate(data)
+        if self.command == "query":
+            return QueryInstructions.model_validate(data)
+        if self.command == "status":
+            return StatusInstructions.model_validate(data)
+        if self.command == "catalog":
+            return CatalogInstructions.model_validate(data)
         raise ValueError(f"Unknown command: {self.command}")
+
 
 class SFFactRecord(BaseModel):
     ticker: str

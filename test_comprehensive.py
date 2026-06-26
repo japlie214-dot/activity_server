@@ -159,7 +159,7 @@ class TestHTTPEndpoints:
         assert r.status_code == 200
         d = r.json()
         assert d["status"] in ("healthy", "degraded")
-        assert len(d["tools"]) == 8
+        assert len(d["tools"]) == 10
 
     def test_root_returns_health(self):
         r = requests.get(f"{BASE}/")
@@ -248,7 +248,8 @@ class TestMCPProtocol:
         s, b = mcp("tools/list", req_id=2)
         names = {t["name"] for t in b["result"]["tools"]}
         expected = {"artifact_saver", "calculator", "crypto", "db_writer",
-                    "healthcheck", "slow_hello", "textstats", "timestamp"}
+                    "healthcheck", "slow_hello", "stock_financials", "stock_notes",
+                    "textstats", "timestamp"}
         assert names == expected
         for t in b["result"]["tools"]:
             assert "inputSchema" in t
@@ -437,7 +438,7 @@ class TestHealthcheck:
     def test_tool(self):
         r = extract(tool_call("healthcheck", {})[1])
         assert r["status"] in ("healthy", "degraded")
-        assert len(r["registered_tools"]) == 8
+        assert len(r["registered_tools"]) == 10
         assert "artifacts" in r["sync_status"]
 
     def test_sync_info(self):

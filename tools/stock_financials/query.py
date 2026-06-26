@@ -1,8 +1,18 @@
 # tools/stock_financials/query.py
-import sqlite3
+"""Query engine for stock_financials — reads from operational DB."""
 import logging
-from typing import List, Dict, Any, Optional
-from database.connection import DatabaseManager
+from typing import Any, Dict, List, Optional
+
+log = logging.getLogger("activity-server")
+
+
+def _get_conn():
+    from server.app import get_server
+    server = get_server()
+    if server is None:
+        raise RuntimeError("Server not initialized")
+    return server.turso
+
 
 def query_facts(
     ticker: str,
@@ -12,31 +22,33 @@ def query_facts(
     end_quarter: Optional[str] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    conn = DatabaseManager.get_read_connection()
-    conn.row_factory = sqlite3.Row
+    conn = _get_conn()
     where = ["ticker = ?", "statement_type = ?"]
     params: List[Any] = [ticker.upper(), statement_type.lower()]
+
     if concept:
-        # Concepts are stored in raw SEC EDGAR XBRL form (e.g. "us-gaap:Assets").
-        # Backward-compat: if a caller passes the legacy normalized form
-        # ("us-gaap_Assets"), restore the colon and emit a deprecation warning.
         normalized = concept.replace("_", ":", 1) if concept.startswith("us-gaap_") else concept
         if normalized != concept:
-            logging.getLogger(__name__).warning("StockFin:Concept:LegacyFormat — received '%s', normalized to '%s'. Update caller to use the raw XBRL format.", concept, normalized)
+            log.warning(f"StockFin:Concept:LegacyFormat — '{concept}' → '{normalized}'")
         where.append("concept = ?")
         params.append(normalized)
+
     if start_quarter:
         where.append("quarter >= ?")
         params.append(start_quarter)
     if end_quarter:
         where.append("quarter <= ?")
         params.append(end_quarter)
+
     sql = f"SELECT * FROM sf_quarterly_facts WHERE {' AND '.join(where)} ORDER BY concept_order ASC, quarter DESC LIMIT ?"
     params.append(limit)
-    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    cur = conn.execute(sql, params)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
 
 def query_concepts(ticker: str, statement_type: Optional[str] = None) -> List[str]:
-    conn = DatabaseManager.get_read_connection()
+    conn = _get_conn()
     where = ["ticker = ?"]
     params = [ticker.upper()]
     if statement_type:
