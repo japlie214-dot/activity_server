@@ -88,7 +88,17 @@ def _compute_row_hash(row_data: dict) -> str:
 # and stores a row_hash on every write. The SchemaManager uses these hashes
 # to verify sync status without comparing every column.
 
-CLOUD_SYNC_TABLES: Set[str] = {"artifacts"}
+CLOUD_SYNC_TABLES: Set[str] = {
+    "artifacts",
+    # stock_financials
+    "sf_tickers",
+    "sf_quarterly_facts",
+    # stock_notes
+    "sn_filings",
+    "sn_notes",
+    "sn_detail_registry",
+    "sn_note_details",
+}
 
 # ── Operational schema (what Turso should look like) ─────────────────
 
@@ -130,6 +140,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("cik",          "TEXT",                "''"),
         Col("created_at",   "TEXT",                "''"),
         Col("updated_at",   "TEXT",                "''"),
+        Col("row_hash",     "TEXT",                "''",
+            compute=_compute_row_hash),
     ]),
     "sf_quarterly_facts": TableSchema("sf_quarterly_facts", [
         Col("id",             "INTEGER PRIMARY KEY", "0"),
@@ -151,6 +163,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("extracted_at",  "TEXT",    "''"),
         Col("created_at",    "TEXT",    "''"),
         Col("updated_at",    "TEXT",    "''"),
+        Col("row_hash",      "TEXT",    "''",
+            compute=_compute_row_hash),
     ]),
 
     # ── stock_notes tables ──
@@ -168,6 +182,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("year",                 "INTEGER",          "0"),
         Col("content_hash",         "TEXT",             "''"),
         Col("updated_at",           "TEXT",             "''"),
+        Col("row_hash",             "TEXT",             "''",
+            compute=_compute_row_hash),
     ]),
     "sn_notes": TableSchema("sn_notes", [
         Col("note_id",              "TEXT PRIMARY KEY", "''"),
@@ -190,6 +206,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("version",              "INTEGER",          "1"),
         Col("content_hash",         "TEXT",             "''"),
         Col("updated_at",           "TEXT",             "''"),
+        Col("row_hash",             "TEXT",             "''",
+            compute=_compute_row_hash),
     ]),
     "sn_detail_registry": TableSchema("sn_detail_registry", [
         Col("registry_id",            "TEXT PRIMARY KEY", "''"),
@@ -208,6 +226,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("content_hash",           "TEXT",             "''"),
         Col("created_at",             "TEXT",             "''"),
         Col("updated_at",             "TEXT",             "''"),
+        Col("row_hash",               "TEXT",             "''",
+            compute=_compute_row_hash),
     ]),
     "sn_note_details": TableSchema("sn_note_details", [
         Col("detail_id",              "TEXT PRIMARY KEY", "''"),
@@ -241,6 +261,8 @@ OPERATIONAL_TABLES: Dict[str, TableSchema] = {
         Col("extracted_at",           "TEXT",             "''"),
         Col("created_at",             "TEXT",             "''"),
         Col("updated_at",             "TEXT",             "''"),
+        Col("row_hash",               "TEXT",             "''",
+            compute=_compute_row_hash),
     ]),
 }
 
@@ -414,6 +436,15 @@ class SchemaManager:
             if not self._table_exists(conn, tbl_name):
                 self._create_table(conn, tbl_name, expected)
 
+    def _get_pk_column(self, tbl_name: str) -> str:
+        """Get the primary key column name for a table from the expected schema."""
+        expected = OPERATIONAL_TABLES.get(tbl_name)
+        if expected:
+            for col in expected.columns:
+                if "PRIMARY KEY" in col.type:
+                    return col.name
+        return "id"
+
     def check_sync(self) -> dict:
         """Check sync status for cloud-synced tables using row hashes.
 
@@ -429,17 +460,18 @@ class SchemaManager:
                     "match": False, "hash_mismatches": 0}
                 continue
 
+            pk = self._get_pk_column(tbl_name)
             op_n = self._count_rows(self.turso, tbl_name)
             cloud_n = self._count_rows(self.cloud, tbl_name)
 
-            # Compare hashes
+            # Compare hashes using the correct PK column
             op_hashes = {}
-            cur = self.turso.execute(f"SELECT id, row_hash FROM {tbl_name}")
+            cur = self.turso.execute(f"SELECT {pk}, row_hash FROM {tbl_name}")
             for row in cur.fetchall():
                 op_hashes[row[0]] = row[1]
 
             hash_mismatches = 0
-            cur = self.cloud.execute(f"SELECT id, row_hash FROM {tbl_name}")
+            cur = self.cloud.execute(f"SELECT {pk}, row_hash FROM {tbl_name}")
             for row in cur.fetchall():
                 cid, chash = row[0], row[1]
                 if cid not in op_hashes:
@@ -448,7 +480,7 @@ class SchemaManager:
                     hash_mismatches += 1
             # Rows in op but not in cloud
             cloud_ids = set()
-            cur = self.cloud.execute(f"SELECT id FROM {tbl_name}")
+            cur = self.cloud.execute(f"SELECT {pk} FROM {tbl_name}")
             for row in cur.fetchall():
                 cloud_ids.add(row[0])
             for oid in op_hashes:

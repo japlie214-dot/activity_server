@@ -18,6 +18,14 @@ def _get_conn():
     return server.turso
 
 
+def _get_dual_writer():
+    from server.app import get_server
+    server = get_server()
+    if server is None:
+        raise RuntimeError("Server not initialized")
+    return server.dual_writer
+
+
 def validate_quarter_date(date_str: str) -> Tuple[bool, str]:
     if not date_str:
         return True, ""
@@ -27,12 +35,12 @@ def validate_quarter_date(date_str: str) -> Tuple[bool, str]:
 
 
 def upsert_tidy_records(records: List[Dict[str, Any]]) -> int:
-    """Insert or replace tidy records into sn_note_details."""
+    """Insert or replace tidy records into sn_note_details (operational + cloud)."""
     if not records:
         return 0
 
-    conn = _get_conn()
     now_iso = datetime.now(timezone.utc).isoformat()
+    dw = _get_dual_writer()
 
     columns = [
         "detail_id", "accession_no", "note_number", "detail_index", "ticker", "form",
@@ -40,28 +48,33 @@ def upsert_tidy_records(records: List[Dict[str, Any]]) -> int:
         "is_breakdown", "dimension_axis", "dimension_member", "dimension_member_label",
         "dimension_label", "balance", "weight", "preferred_sign", "parent_concept",
         "parent_abstract_concept", "period_raw", "period_end_date", "period_type",
-        "value", "row_order", "content_hash", "extracted_at", "created_at", "updated_at"
+        "value", "row_order", "content_hash", "extracted_at", "created_at", "updated_at",
     ]
-
-    sql = f'INSERT OR REPLACE INTO sn_note_details ({", ".join(columns)}) VALUES ({", ".join(["?"] * len(columns))})'
 
     for r in records:
         r["extracted_at"] = r.get("extracted_at") or now_iso
         r["created_at"] = r.get("created_at") or now_iso
         r["updated_at"] = r.get("updated_at") or now_iso
-        vals = []
+        data = {}
         for c in columns:
             val = r.get(c)
             if val is None:
-                if c in ("note_number", "detail_index", "level", "row_order"):
-                    vals.append(0)
-                else:
-                    vals.append("")
+                data[c] = 0 if c in ("note_number", "detail_index", "level", "row_order") else ""
             else:
-                vals.append(val)
-        conn.execute(sql, tuple(vals))
+                data[c] = val
 
-    conn.commit()
+        if dw:
+            dw.upsert("sn_note_details", data)
+        else:
+            conn = _get_conn()
+            cols_sql = ", ".join(data.keys())
+            placeholders = ", ".join(["?"] * len(data))
+            conn.execute(
+                f"INSERT OR REPLACE INTO sn_note_details ({cols_sql}) VALUES ({placeholders})",
+                list(data.values()),
+            )
+            conn.commit()
+
     return len(records)
 
 
@@ -108,17 +121,23 @@ def format_as_markdown_table(records: List[Dict[str, Any]], table_name: str) -> 
 
 
 def delete_filing_data(accession_no: str) -> int:
-    """Delete all data for a filing (for force-refresh)."""
-    conn = _get_conn()
-    count = conn.execute(
-        "SELECT COUNT(*) FROM sn_note_details WHERE accession_no = ?", (accession_no,)
-    ).fetchone()[0]
+    """Delete all data for a filing (for force-refresh). Deletes from both local and cloud."""
+    dw = _get_dual_writer()
 
-    if count > 0:
-        conn.execute("DELETE FROM sn_note_details WHERE accession_no = ?", (accession_no,))
-    conn.execute("DELETE FROM sn_detail_registry WHERE source_accession_no = ?", (accession_no,))
-    conn.execute("DELETE FROM sn_notes WHERE accession_no = ?", (accession_no,))
-    conn.commit()
+    if dw:
+        count = dw.delete("sn_note_details", "WHERE accession_no = ?", (accession_no,))
+        dw.delete("sn_detail_registry", "WHERE source_accession_no = ?", (accession_no,))
+        dw.delete("sn_notes", "WHERE accession_no = ?", (accession_no,))
+    else:
+        conn = _get_conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sn_note_details WHERE accession_no = ?", (accession_no,)
+        ).fetchone()[0]
+        if count > 0:
+            conn.execute("DELETE FROM sn_note_details WHERE accession_no = ?", (accession_no,))
+        conn.execute("DELETE FROM sn_detail_registry WHERE source_accession_no = ?", (accession_no,))
+        conn.execute("DELETE FROM sn_notes WHERE accession_no = ?", (accession_no,))
+        conn.commit()
     return count
 
 
@@ -191,18 +210,41 @@ def register_detail_table(
 ):
     from .tidy_transform import make_registry_id
 
-    conn = _get_conn()
+    dw = _get_dual_writer()
     rid = make_registry_id(ticker, detail_table_name, source_accession_no, source_note_number)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    conn.execute(
-        """INSERT OR REPLACE INTO sn_detail_registry
-           (registry_id, ticker, detail_table_name, source_title, source_note_number,
-            source_accession_no, role_or_type, available_concepts, tidy_schema_version,
-            row_count, quarter, year, quarterly_status, content_hash, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '', ?, ?)""",
-        (rid, ticker, detail_table_name, source_title, source_note_number,
-         source_accession_no, role_or_type, json.dumps(unique_concepts),
-         row_count, quarter, year, quarterly_status, now_iso, now_iso)
-    )
-    conn.commit()
+    registry_data = {
+        "registry_id": rid,
+        "ticker": ticker,
+        "detail_table_name": detail_table_name,
+        "source_title": source_title,
+        "source_note_number": source_note_number,
+        "source_accession_no": source_accession_no,
+        "role_or_type": role_or_type,
+        "available_concepts": json.dumps(unique_concepts),
+        "tidy_schema_version": 1,
+        "row_count": row_count,
+        "quarter": quarter,
+        "year": year,
+        "quarterly_status": quarterly_status,
+        "content_hash": "",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    if dw:
+        dw.upsert("sn_detail_registry", registry_data)
+    else:
+        conn = _get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO sn_detail_registry
+               (registry_id, ticker, detail_table_name, source_title, source_note_number,
+                source_accession_no, role_or_type, available_concepts, tidy_schema_version,
+                row_count, quarter, year, quarterly_status, content_hash, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '', ?, ?)""",
+            (rid, ticker, detail_table_name, source_title, source_note_number,
+             source_accession_no, role_or_type, json.dumps(unique_concepts),
+             row_count, quarter, year, quarterly_status, now_iso, now_iso),
+        )
+        conn.commit()

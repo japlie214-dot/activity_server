@@ -5,7 +5,7 @@
 
 ### Cloud-Synced Tables (`CLOUD_SYNC_TABLES`)
 
-Only tables with irreplaceable user-created content are synced to Snowflake.
+Tables with irreplaceable user-created content are synced to Snowflake.
 Each synced table has a `row_hash` column for content-addressable sync verification.
 
 #### `artifacts` — File artifacts produced by tools
@@ -16,13 +16,170 @@ means losing work. Cloud backup ensures durability.
 | Column | Type | Why |
 |--------|------|-----|
 | `id` | INTEGER PRIMARY KEY | Row identifier, used for hash comparison across databases |
-| `tool_name` | TEXT | Which tool created this artifact. Enables filtering by source |
-| `filename` | TEXT | Human-readable name. Used for display and `GET /artifacts` listing |
-| `filepath` | TEXT | Absolute path on disk. Needed to locate the actual file |
-| `size_bytes` | INTEGER | File size without reading the file. Useful for capacity planning and display |
-| `content_preview` | TEXT | First 200 chars of content. Enables quick identification without reading the file |
-| `created_at` | TEXT | ISO-8601 timestamp. Needed for sorting, filtering, and "when was this created?" |
-| `row_hash` | TEXT | SHA-256 hash of row content (excluding id and row_hash). Enables O(n) sync verification instead of comparing every column |
+| `tool_name` | TEXT | Which tool created this artifact |
+| `filename` | TEXT | Human-readable name |
+| `filepath` | TEXT | Absolute path on disk |
+| `size_bytes` | INTEGER | File size without reading the file |
+| `content_preview` | TEXT | First 200 chars of content |
+| `created_at` | TEXT | ISO-8601 timestamp |
+| `row_hash` | TEXT | SHA-256 hash for sync verification |
+
+#### `sf_tickers` — Stock ticker registry (stock_financials)
+
+**Why synced:** Links tickers to CIK/company names. Irreplaceable metadata.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `ticker` | TEXT PRIMARY KEY | Stock ticker (e.g., "AAPL") |
+| `company_name` | TEXT | Company name from EDGAR |
+| `cik` | TEXT | SEC CIK number |
+| `created_at` | TEXT | First extraction timestamp |
+| `updated_at` | TEXT | Last update timestamp |
+
+#### `sf_quarterly_facts` — Quarterly financial facts (stock_financials)
+
+**Why synced:** Core financial data extracted from SEC EDGAR XBRL. Expensive
+to re-fetch and irreplaceable once filings are amended or removed.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `id` | INTEGER PRIMARY KEY | Row identifier |
+| `ticker` | TEXT | Stock ticker |
+| `statement_type` | TEXT | income, balance, or cashflow |
+| `concept` | TEXT | XBRL concept (e.g., "us-gaap:Revenues") |
+| `label` | TEXT | Human-readable label from XBRL blueprint |
+| `quarter` | TEXT | Quarter label (e.g., "2025-Q2") |
+| `period_end` | TEXT | Period end date |
+| `fiscal_period` | TEXT | Q1, Q2, Q3, Q4, or FY |
+| `fiscal_year` | INTEGER | Fiscal year |
+| `numeric_value` | REAL | The fact value |
+| `unit` | TEXT | Unit of measure (USD, shares, etc.) |
+| `period_type` | TEXT | duration or instant |
+| `depth` | INTEGER | Nesting depth in statement blueprint |
+| `is_total` | INTEGER | 1 if this is a total/subtotal line |
+| `concept_order` | INTEGER | Ordering from the statement blueprint |
+| `content_hash` | TEXT | MD5 hash for idempotent upserts |
+| `extracted_at` | TEXT | When the data was fetched from EDGAR |
+| `created_at` | TEXT | First insert timestamp |
+| `updated_at` | TEXT | Last update timestamp |
+| `row_hash` | TEXT | SHA-256 hash for cloud sync verification |
+
+#### `sn_filings` — Filing metadata (stock_notes)
+
+**Why synced:** Filing metadata (accession numbers, periods, quarters) is
+the index into all footnote data. Losing it means losing the map.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `filing_id` | TEXT PRIMARY KEY | Composite: ticker|form|accession_no |
+| `ticker` | TEXT | Stock ticker |
+| `form` | TEXT | Form type (10-K, 10-Q, 20-F, 6-K) |
+| `filing_date` | TEXT | Date filing was submitted |
+| `accession_no` | TEXT | SEC accession number |
+| `period_of_report` | TEXT | Reporting period end date |
+| `company_name` | TEXT | Company name |
+| `cik` | TEXT | SEC CIK number |
+| `fiscal_year_end_month` | INTEGER | Fiscal year-end month (1-12) |
+| `quarter` | INTEGER | Fiscal quarter (1-4) |
+| `year` | INTEGER | Fiscal year |
+| `content_hash` | TEXT | Hash for idempotent upserts |
+| `updated_at` | TEXT | Last update timestamp |
+| `row_hash` | TEXT | SHA-256 hash for cloud sync verification |
+
+#### `sn_notes` — Individual footnotes (stock_notes)
+
+**Why synced:** Footnote narratives and metadata are unique content extracted
+from SEC filings. Re-extraction is expensive and may differ if filings are amended.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `note_id` | TEXT PRIMARY KEY | Composite: filing_id|N{number} |
+| `filing_id` | TEXT | FK to sn_filings |
+| `ticker` | TEXT | Stock ticker |
+| `form` | TEXT | Form type |
+| `accession_no` | TEXT | SEC accession number |
+| `note_number` | INTEGER | Note number within the filing |
+| `title` | TEXT | Note title |
+| `short_name` | TEXT | Short display name |
+| `narrative_text` | TEXT | Full narrative content |
+| `narrative_hash` | TEXT | MD5 hash of narrative |
+| `expands` | TEXT | JSON array of expandable references |
+| `expands_statements` | TEXT | JSON array of statement references |
+| `table_count` | INTEGER | Number of embedded tables |
+| `details_count` | INTEGER | Number of detail (XBRL) tables |
+| `quarter` | INTEGER | Fiscal quarter |
+| `year` | INTEGER | Fiscal year |
+| `quarterly_status` | TEXT | direct, from_annual_filing, etc. |
+| `version` | INTEGER | Record version (for future conflict resolution) |
+| `content_hash` | TEXT | Hash for idempotent upserts |
+| `updated_at` | TEXT | Last update timestamp |
+| `row_hash` | TEXT | SHA-256 hash for cloud sync verification |
+
+#### `sn_detail_registry` — Registry of hydrated detail tables (stock_notes)
+
+**Why synced:** Tracks which XBRL detail tables have been parsed into tidy format.
+Losing this means re-hydrating all detail tables from scratch.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `registry_id` | TEXT PRIMARY KEY | MD5 hash of composite key |
+| `ticker` | TEXT | Stock ticker |
+| `detail_table_name` | TEXT | Generated table name |
+| `source_title` | TEXT | Original detail table title |
+| `source_note_number` | INTEGER | Parent note number |
+| `source_accession_no` | TEXT | Parent filing accession number |
+| `role_or_type` | TEXT | Role or type classification |
+| `available_concepts` | TEXT | JSON array of XBRL concepts |
+| `tidy_schema_version` | INTEGER | Schema version for migration |
+| `row_count` | INTEGER | Number of tidy records |
+| `quarter` | INTEGER | Fiscal quarter |
+| `year` | INTEGER | Fiscal year |
+| `quarterly_status` | TEXT | direct, from_annual_filing, etc. |
+| `content_hash` | TEXT | Hash for idempotent upserts |
+| `created_at` | TEXT | First insert timestamp |
+| `updated_at` | TEXT | Last update timestamp |
+| `row_hash` | TEXT | SHA-256 hash for cloud sync verification |
+
+#### `sn_note_details` — Tidy-format XBRL detail records (stock_notes)
+
+**Why synced:** The actual parsed footnote data in tidy (long) format. This is
+the most expensive data to produce — it requires parsing complex XBRL tables
+from EDGAR filings. Losing it means re-hydrating every note detail.
+
+| Column | Type | Why |
+|--------|------|-----|
+| `detail_id` | TEXT PRIMARY Key | Composite: accession|note|detail|concept|period|row |
+| `accession_no` | TEXT | SEC accession number |
+| `note_number` | INTEGER | Parent note number |
+| `detail_index` | INTEGER | Detail table index within note |
+| `ticker` | TEXT | Stock ticker |
+| `form` | TEXT | Form type |
+| `concept` | TEXT | XBRL concept |
+| `label` | TEXT | Human-readable label |
+| `standard_concept` | TEXT | Standardized concept name |
+| `level` | INTEGER | Nesting level |
+| `abstract` | TEXT | "True" or "False" |
+| `dimension` | TEXT | Dimension identifier |
+| `is_breakdown` | TEXT | Whether this is a breakdown row |
+| `dimension_axis` | TEXT | XBRL dimension axis |
+| `dimension_member` | TEXT | XBRL dimension member |
+| `dimension_member_label` | TEXT | Human-readable member label |
+| `dimension_label` | TEXT | Human-readable dimension label |
+| `balance` | TEXT | debit/credit |
+| `weight` | TEXT | Weight value |
+| `preferred_sign` | TEXT | Preferred sign |
+| `parent_concept` | TEXT | Parent concept in hierarchy |
+| `parent_abstract_concept` | TEXT | Parent abstract concept |
+| `period_raw` | TEXT | Raw period string from XBRL |
+| `period_end_date` | TEXT | Parsed period end date (YYYY-MM-DD) |
+| `period_type` | TEXT | FY, Q1-Q4, YTD, H1-H2 |
+| `value` | TEXT | The fact value (as string) |
+| `row_order` | INTEGER | Row ordering within the table |
+| `content_hash` | TEXT | MD5 hash for idempotent upserts |
+| `extracted_at` | TEXT | When the data was extracted |
+| `created_at` | TEXT | First insert timestamp |
+| `updated_at` | TEXT | Last update timestamp |
+| `row_hash` | TEXT | SHA-256 hash for cloud sync verification |
 
 ### Operational-Only Tables
 
@@ -33,23 +190,20 @@ ephemeral operational data that doesn't need cloud backup.
 
 **Why exists:** Every tool invocation is automatically recorded by the handler.
 Provides "what did I run and what happened" without requiring `X-Observe`.
-This is the operational audit trail — lightweight, always-on, no opt-in needed.
 
-**Why operational-only:** Tool runs are high-volume ephemeral data. They're
-useful for debugging and history but not irreplaceable. Cloud backup would
-waste storage on data that's only relevant短期.
+**Why operational-only:** Tool runs are high-volume ephemeral data.
 
 | Column | Type | Why |
 |--------|------|-----|
 | `id` | INTEGER PRIMARY KEY | Row identifier |
-| `tool_name` | TEXT | Which tool was run. Enables filtering: "show me all calculator runs" |
-| `arguments_json` | TEXT | The input arguments as JSON. Needed to reproduce or understand the run |
-| `result_json` | TEXT | The tool's output as JSON. Needed to see what happened |
-| `ok` | INTEGER | 1 = success, 0 = failure. Enables quick filtering of failures |
-| `error` | TEXT | Error message if failed. Empty string on success. Needed for debugging |
-| `duration_ms` | REAL | Wall-clock time. Enables performance monitoring and slow-tool detection |
-| `started_at` | TEXT | ISO-8601 start time. Needed for timeline reconstruction |
-| `completed_at` | TEXT | ISO-8601 end time. Needed for timeline reconstruction |
+| `tool_name` | TEXT | Which tool was run |
+| `arguments_json` | TEXT | The input arguments as JSON |
+| `result_json` | TEXT | The tool's output as JSON |
+| `ok` | INTEGER | 1 = success, 0 = failure |
+| `error` | TEXT | Error message if failed |
+| `duration_ms` | REAL | Wall-clock time |
+| `started_at` | TEXT | ISO-8601 start time |
+| `completed_at` | TEXT | ISO-8601 end time |
 
 #### `tools` — Tool registry
 
@@ -57,15 +211,14 @@ waste storage on data that's only relevant短期.
 they were registered. Rebuilt every startup from discovered tool modules.
 
 **Why operational-only:** The registry is rebuilt from code on every startup.
-Cloud backup is pointless — the source of truth is the codebase itself.
 
 | Column | Type | Why |
 |--------|------|-----|
 | `id` | INTEGER PRIMARY KEY | Row identifier |
-| `name` | TEXT UNIQUE | Tool name. The primary lookup key for tool discovery |
-| `description` | TEXT | One-line description. Used in health checks and listings |
-| `input_schema` | TEXT | JSON Schema. Needed by MCP `tools/list` to describe tool inputs |
-| `registered_at` | TEXT | ISO-8601 timestamp. Useful for "when did this tool appear?" |
+| `name` | TEXT UNIQUE | Tool name |
+| `description` | TEXT | One-line description |
+| `input_schema` | TEXT | JSON Schema |
+| `registered_at` | TEXT | ISO-8601 timestamp |
 
 ### Telemetry Tables (local `telemetry.db`)
 
@@ -78,37 +231,18 @@ interfering with operational data. It's never synced.
 | Column | Type | Why |
 |--------|------|-----|
 | `id` | INTEGER PRIMARY KEY | Row identifier |
-| `activity_name` | TEXT | Activity name (e.g., `tool.calculator`, `schema.check_sync`). Enables filtering |
-| `input_data` | TEXT | Serialized input. Needed to understand what triggered the activity |
-| `output_data` | TEXT | Serialized output. Needed to see the result |
-| `error` | TEXT | Error message if failed. Empty on success |
-| `ok` | INTEGER | 1 = success, 0 = failure. Quick filter for failures |
-| `duration_ms` | REAL | Wall-clock time. Performance monitoring |
+| `activity_name` | TEXT | Activity name |
+| `input_data` | TEXT | Serialized input |
+| `output_data` | TEXT | Serialized output |
+| `error` | TEXT | Error message if failed |
+| `ok` | INTEGER | 1 = success, 0 = failure |
+| `duration_ms` | REAL | Wall-clock time |
 | `started_at` | TEXT | ISO-8601 start time |
-| `logged_at` | TEXT | ISO-8601 time when the telemetry was recorded (may differ from started_at due to queue drain delay) |
-
-### Removed Tables
-
-- **`users`** — Not needed. This is a tool host, not a user management system.
-- **`transactions`** — Not needed. Was a demo table with no real purpose.
+| `logged_at` | TEXT | ISO-8601 time when recorded |
 
 ## Why Migration Scripts Are Illegal
 
-Traditional migration scripts (`001_add_column.sql`, `002_create_table.sql`, etc.)
-are a **maintenance burden** and a **source of bugs**. Here's why this project
-uses auto-heal instead:
-
-### Problems with migrations
-
-1. **Ordering nightmares**: Which migration ran last? What if someone skipped one?
-2. **Environment drift**: Dev, staging, and production databases diverge silently.
-3. **Rollback complexity**: Down migrations are fragile and often untested.
-4. **Human error**: Forgetting to run a migration after pulling code = broken app.
-5. **Merge conflicts**: Two developers adding columns = conflicting migration files.
-6. **Brittle deploys**: Deployment scripts must know the exact migration sequence.
-
-### The auto-heal alternative
-
+Traditional migration scripts are a **maintenance burden** and a **source of bugs**.
 The **Expected Schema** (defined in `db/schema.py`) is the single source of truth.
 On every startup, `SchemaManager` compares the actual database state against it:
 
@@ -116,76 +250,36 @@ On every startup, `SchemaManager` compares the actual database state against it:
 |---|---|---|
 | Missing table | Create it | Create it (synced tables only) |
 | Missing column | Add with default value | Add with default value |
-| Unexpected column | **Rebuild table** (see below) | **Rebuild table** |
+| Unexpected column | **Rebuild table** | **Rebuild table** |
 | Unexpected table | **Drop it** | **Leave it** (other systems may own it) |
 
-### Table rebuild (unexpected columns)
+## DualWriter — Write Patterns
 
-When a table has columns that aren't in the expected schema, the SchemaManager
-performs a non-destructive rebuild:
+The `DualWriter` supports three write patterns for cloud-synced tables:
 
-1. **Backup** all existing rows
-2. **Drop** the table
-3. **Recreate** with the expected schema
-4. **Repopulate** from backup (matching columns only)
-5. **Compute** values for new columns that have `compute` functions
+| Method | SQL Pattern | Use Case |
+|--------|-------------|----------|
+| `write(table, data)` | INSERT | New rows with auto-generated IDs |
+| `upsert(table, data)` | INSERT OR REPLACE | Composite-key tables (stock tools) |
+| `delete(table, where, params)` | DELETE | Purge before refresh |
+| `execute_on_both(sql, params)` | Raw SQL | Complex operations |
 
-This handles schema evolution gracefully:
-- Old columns not in the new schema → silently dropped from the backup
-- New columns in the schema not in the backup → filled with computed values or defaults
-- The `row_hash` column uses a `compute` function that hashes all other columns
+All methods automatically:
+- Compute `row_hash` for synced tables
+- Write to operational (Turso) first
+- Write to cloud (Snowflake) second
+- Queue failed cloud writes for retry with exponential backoff
 
-```python
-Col("row_hash", "TEXT", "''",
-    compute=lambda row: hashlib.sha256(
-        ";".join(f"{k}={v}" for k, v in sorted(row.items())
-                 if k not in {"id", "row_hash"}
-        ).encode()
-    ).hexdigest()[:16]),
-```
-
-This means you can add a new column with complex computation logic (hashes,
-derived values, lookups) and existing data will be filled correctly on the
-next startup.
-
-### How it works
-
-1. Define your schema in Python: `Col("name", "TEXT", "''")`
-2. On startup, `SchemaManager.validate_operational()` runs
-3. It queries `PRAGMA table_info()` for each expected table
-4. Missing columns get `ALTER TABLE ADD COLUMN ... DEFAULT ...`
-5. Missing tables get `CREATE TABLE`
-6. Unexpected tables get `DROP TABLE`
-7. Done. No scripts, no ordering, no human intervention.
-
-### Default values matter
-
-When adding a column, the default value fills existing rows. Design defaults carefully:
-
-```python
-Col("size_bytes",   "INTEGER", "0")      # numeric zero
-Col("created_at",   "TEXT",    "''")      # empty string, not NULL
-Col("row_hash",     "TEXT",    "''")      # empty string — will be computed on next write
-Col("ok",           "INTEGER", "1")       # boolean as int
-```
-
-### Cloud-specific behavior
-
-The cloud (Snowflake) only contains synced tables. Unexpected tables in cloud
-are left alone because other systems may own them.
-
-## Sync Verification
+### Sync Verification
 
 Synced tables use **row hashes** for verification. Each row has a `row_hash`
 column containing a SHA-256 hash of all column values (except `id` and
 `row_hash` itself).
 
-On startup, the SchemaManager compares hashes between operational and cloud:
-- Same id, same hash → in sync
-- Same id, different hash → data diverged
-- Id exists in one but not other → row missing
+Sync is verified on **startup only** (not shutdown). This prevents a faulty
+run from overwriting healthy cloud data during the shutdown sequence.
 
-This is O(n) instead of comparing every column of every row.
+## Connection Architecture
 
 ```
 ┌──────────────┐     ┌──────────────┐
@@ -193,6 +287,12 @@ This is O(n) instead of comparing every column of every row.
 │  (Operational)│     │  (Snowflake  │
 │              │     │   mock)      │
 │ artifacts  ──┼─────┼── artifacts  │  ← synced (row_hash verified)
+│ sf_tickers ──┼─────┼── sf_tickers │  ← synced (stock_financials)
+│ sf_quarterly─┼─────┼── sf_quarterly│ ← synced (stock_financials)
+│ sn_filings ──┼─────┼── sn_filings │  ← synced (stock_notes)
+│ sn_notes   ──┼─────┼── sn_notes   │  ← synced (stock_notes)
+│ sn_detail_r─┼─────┼── sn_detail_r│  ← synced (stock_notes)
+│ sn_note_det─┼─────┼── sn_note_det│  ← synced (stock_notes)
 │ tool_runs    │     │              │  ← operational only
 │ tools        │     │              │  ← operational only
 └──────┬───────┘     └──────┬───────┘
@@ -201,16 +301,10 @@ This is O(n) instead of comparing every column of every row.
                 │
          ┌──────┴───────┐
          │  DualWriter   │
-         │  (write-thru  │
-         │   + hash)     │
+         │  write/upsert │
+         │  delete/retry │
          └──────────────┘
 ```
-
-## Connection Architecture
-
-Every write goes to Operational first. If the table is in `CLOUD_SYNC_TABLES`,
-the write also goes to Cloud with an automatic `row_hash`. If Cloud fails,
-the write is queued for retry with exponential backoff.
 
 ## Files
 
@@ -219,5 +313,5 @@ the write is queued for retry with exponential backoff.
 | `config.py` | Loads `.env`, exposes all DB settings |
 | `turso.py` | Turso connection (pyturso) — local or remote-synced |
 | `cloud.py` | Snowflake mock connection (local pyturso) |
-| `dual.py` | DualWriter — write-through with hash + retry |
+| `dual.py` | DualWriter — write/upsert/delete with hash + retry |
 | `schema.py` | Expected Schema + SchemaManager (auto-heal) + CLOUD_SYNC_TABLES |

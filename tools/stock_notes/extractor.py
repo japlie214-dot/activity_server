@@ -19,6 +19,14 @@ def _get_conn():
     return server.turso
 
 
+def _get_dual_writer():
+    from server.app import get_server
+    server = get_server()
+    if server is None:
+        raise RuntimeError("Server not initialized")
+    return server.dual_writer
+
+
 def _set_edgar_identity():
     import os
     from edgar import set_identity
@@ -83,7 +91,10 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
     if not filing:
         raise ValueError(f"Filing {accession_no} not found in EDGAR.")
 
+    dw = _get_dual_writer()
+
     if force_refresh:
+        from .detail_manager import delete_filing_data
         deleted = delete_filing_data(accession_no)
         if deleted > 0:
             log.info(f"StockNotes:Rehydrate — deleted {deleted} rows for {accession_no}")
@@ -118,15 +129,33 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
     filing_hash = hashlib.md5(f"{ticker}|{form}|{accession_no}|{period}|{cik}".encode()).hexdigest()
     now_iso = datetime.utcnow().isoformat()
 
-    conn.execute(
-        """INSERT OR REPLACE INTO sn_filings
-           (filing_id, ticker, form, filing_date, accession_no, period_of_report,
-            company_name, cik, fiscal_year_end_month, quarter, year, content_hash, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-        (filing_id, ticker, form, str(filing.filing_date), accession_no, period,
-         str(getattr(filing, 'company', 'Unknown')), str(cik), fy_month, quarter, year, filing_hash)
-    )
-    conn.commit()
+    filing_data = {
+        "filing_id": filing_id,
+        "ticker": ticker,
+        "form": form,
+        "filing_date": str(filing.filing_date),
+        "accession_no": accession_no,
+        "period_of_report": period,
+        "company_name": str(getattr(filing, 'company', 'Unknown')),
+        "cik": str(cik),
+        "fiscal_year_end_month": fy_month,
+        "quarter": quarter,
+        "year": year,
+        "content_hash": filing_hash,
+        "updated_at": now_iso,
+    }
+    if dw:
+        dw.upsert("sn_filings", filing_data)
+    else:
+        conn.execute(
+            """INSERT OR REPLACE INTO sn_filings
+               (filing_id, ticker, form, filing_date, accession_no, period_of_report,
+                company_name, cik, fiscal_year_end_month, quarter, year, content_hash, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (filing_id, ticker, form, str(filing.filing_date), accession_no, period,
+             str(getattr(filing, 'company', 'Unknown')), str(cik), fy_month, quarter, year, filing_hash)
+        )
+        conn.commit()
 
     if not hasattr(obj, "notes") or not obj.notes:
         return {"filing_id": filing_id, "ticker": ticker, "accession_no": accession_no,
@@ -171,18 +200,43 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                         pass
 
             # Insert note record
-            conn.execute(
-                """INSERT OR REPLACE INTO sn_notes
-                   (note_id, filing_id, ticker, form, accession_no, note_number, title, short_name,
-                    narrative_text, narrative_hash, expands, expands_statements,
-                    table_count, details_count, quarter, year, quarterly_status, version, content_hash, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                (note_id, filing_id, ticker, form, accession_no, note.number, note.title,
-                 getattr(note, "short_name", note.title) or note.title,
-                 narrative, narrative_hash, json.dumps(expands), json.dumps(expands_statements),
-                 table_count, details_count, quarter, year, q_status, 1, note_hash)
-            )
-            conn.commit()
+            note_data = {
+                "note_id": note_id,
+                "filing_id": filing_id,
+                "ticker": ticker,
+                "form": form,
+                "accession_no": accession_no,
+                "note_number": note.number,
+                "title": note.title,
+                "short_name": getattr(note, "short_name", note.title) or note.title,
+                "narrative_text": narrative,
+                "narrative_hash": narrative_hash,
+                "expands": json.dumps(expands),
+                "expands_statements": json.dumps(expands_statements),
+                "table_count": table_count,
+                "details_count": details_count,
+                "quarter": quarter,
+                "year": year,
+                "quarterly_status": q_status,
+                "version": 1,
+                "content_hash": note_hash,
+                "updated_at": now_iso,
+            }
+            if dw:
+                dw.upsert("sn_notes", note_data)
+            else:
+                conn.execute(
+                    """INSERT OR REPLACE INTO sn_notes
+                       (note_id, filing_id, ticker, form, accession_no, note_number, title, short_name,
+                        narrative_text, narrative_hash, expands, expands_statements,
+                        table_count, details_count, quarter, year, quarterly_status, version, content_hash, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                    (note_id, filing_id, ticker, form, accession_no, note.number, note.title,
+                     getattr(note, "short_name", note.title) or note.title,
+                     narrative, narrative_hash, json.dumps(expands), json.dumps(expands_statements),
+                     table_count, details_count, quarter, year, q_status, 1, note_hash)
+                )
+                conn.commit()
         except Exception as e:
             log.warning(f"StockNotes:Note:{accession_no}:N{note.number} — {e}")
 

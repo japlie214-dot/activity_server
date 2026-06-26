@@ -352,6 +352,35 @@ The `artifact_saver` tool demonstrates this.
 | `artifact_saver` | prepare, write_file, record_db | sync | **writes** | **writes** |
 | `healthcheck` | check_sync, gather_stats | sync | reads | no |
 | `slow_hello` | validate, wait_and_respond | **async** | no | no |
+| `stock_financials` | validate, execute, format | sync | **reads/writes** | no |
+| `stock_notes` | validate, execute, format | sync | **reads/writes** | no |
+
+### Stock Tools — Database Integration
+
+Both `stock_financials` and `stock_notes` use the `DualWriter` for all database
+operations. Every write goes to both the operational database (Turso) and the
+cloud backup (Snowflake) automatically.
+
+**stock_financials** — 3 Activities:
+1. `stock_financials.validate` — Parse and validate command + instructions
+2. `stock_financials.execute` — Dispatch to extract/query/status/catalog
+3. `stock_financials.format` — Normalize result into response dict
+
+Commands: `extract` (fetch from EDGAR), `query` (read cached facts by
+statement_type: income/balance/cashflow), `status` (cache stats),
+`catalog` (available XBRL concepts).
+
+**stock_notes** — 3 Activities:
+1. `stock_notes.validate` — Parse and validate command + instructions
+2. `stock_notes.execute` — Dispatch to discover/note/details
+3. `stock_notes.format` — Normalize result into response dict
+
+Commands: `discover` (list filings), `note` (list/drill into footnotes),
+`details` (time-series for a specific XBRL concept).
+
+**Refresh behavior:** Both tools support `refresh: true` to purge local + cloud
+data and re-extract from EDGAR. `stock_notes` also accepts `force_refresh` as
+a backward-compatible alias.
 
 ## Developer Contract — Documentation Requirement
 

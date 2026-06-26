@@ -202,12 +202,9 @@ class Server:
                 pass
         self.tel_conn.commit()
 
-        # Final sync — operational wins for synced tables
-        log.info("Final sync check (operational wins)...")
-        sync = self.schema_manager.check_sync()
-        if not self.schema_manager.in_sync:
-            log.warning("  Out of sync — forcing operational → cloud")
-            self.resolve_sync("operational")
+        # No sync check on shutdown — sync is only verified on startup.
+        # Forcing operational-to-cloud on shutdown could overwrite healthy
+        # cloud data if the operational DB had issues during the run.
 
         self.tel_conn.close_sync()
         self.cloud.close_sync()

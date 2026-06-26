@@ -25,6 +25,14 @@ def _get_conn():
     return server.turso
 
 
+def _get_dual_writer():
+    from server.app import get_server
+    server = get_server()
+    if server is None:
+        raise RuntimeError("Server not initialized")
+    return server.dual_writer
+
+
 def _parse_quarter_label(qlabel: str) -> Tuple[int, int]:
     try:
         parts = qlabel.split("-Q")
@@ -208,17 +216,19 @@ def process_cashflow(all_facts_df, bp, num_quarters):
 
 
 def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
-    """Insert or update quarterly fact records in the operational database."""
-    if not records: return 0
-    conn = _get_conn()
+    """Insert or update quarterly fact records in operational + cloud databases."""
+    if not records:
+        return 0
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    columns = ["ticker", "statement_type", "concept", "label", "quarter", "period_end",
-               "fiscal_period", "fiscal_year", "numeric_value", "unit", "period_type",
-               "depth", "is_total", "concept_order", "content_hash", "extracted_at", "created_at", "updated_at"]
+    columns = [
+        "ticker", "statement_type", "concept", "label", "quarter", "period_end",
+        "fiscal_period", "fiscal_year", "numeric_value", "unit", "period_type",
+        "depth", "is_total", "concept_order", "content_hash",
+        "extracted_at", "created_at", "updated_at",
+    ]
 
-    sql = f"""INSERT OR REPLACE INTO sf_quarterly_facts
-              ({', '.join(columns)}) VALUES ({', '.join(['?']*len(columns))})"""
+    dw = _get_dual_writer()
 
     for r in records:
         r["quarter"] = r.get("quarter_label", "")
@@ -235,9 +245,9 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
                 continue
             if isinstance(val, float) and pd.isna(val):
                 r[key] = None
-            elif hasattr(val, 'isoformat'):  # pandas Timestamp or datetime
+            elif hasattr(val, "isoformat"):
                 r[key] = str(val)
-            elif isinstance(val, (int,)) and not isinstance(val, bool):
+            elif isinstance(val, int) and not isinstance(val, bool):
                 r[key] = int(val)
             elif isinstance(val, float):
                 r[key] = float(val)
@@ -245,10 +255,20 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
                 r[key] = str(val)
 
         defaults = {"fiscal_year": 0, "depth": 0, "is_total": 0, "concept_order": 0}
-        values = tuple(r.get(c, defaults.get(c, "")) for c in columns)
-        conn.execute(sql, values)
+        data = {c: r.get(c, defaults.get(c, "")) for c in columns}
 
-    conn.commit()
+        if dw:
+            dw.upsert("sf_quarterly_facts", data)
+        else:
+            conn = _get_conn()
+            cols_sql = ", ".join(data.keys())
+            placeholders = ", ".join(["?"] * len(data))
+            conn.execute(
+                f"INSERT OR REPLACE INTO sf_quarterly_facts ({cols_sql}) VALUES ({placeholders})",
+                list(data.values()),
+            )
+            conn.commit()
+
     return len(records)
 
 
@@ -264,8 +284,12 @@ def extract_and_persist(ticker: str, num_quarters: int, refresh: bool) -> Dict[s
     conn = _get_conn()
 
     if refresh:
-        conn.execute("DELETE FROM sf_quarterly_facts WHERE ticker = ?", (ticker,))
-        conn.commit()
+        dw = _get_dual_writer()
+        if dw:
+            dw.delete("sf_quarterly_facts", "WHERE ticker = ?", (ticker,))
+        else:
+            conn.execute("DELETE FROM sf_quarterly_facts WHERE ticker = ?", (ticker,))
+            conn.commit()
 
     company = Company(ticker)
     now_iso = datetime.now(timezone.utc).isoformat()

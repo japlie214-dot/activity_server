@@ -1,11 +1,16 @@
 # tools/stock_notes/docs.py
-TOOL_DESCRIPTION = "Extract and explore SEC EDGAR filing footnotes (10-K, 10-Q, 20-F, 6-K) — narratives, embedded data tables, and dimensional XBRL concepts."
+TOOL_DESCRIPTION = (
+    "Extract and explore SEC EDGAR filing footnotes (10-K, 10-Q, 20-F, 6-K) "
+    "— narratives, embedded data tables, and dimensional XBRL concepts."
+)
 
 TOOL_DOCS = """## Stock Notes
 
 An advanced footnote extraction and analysis tool that drills into detailed SEC
 filing footnotes to isolate narratives, parse embedded data tables, and expose
 dimensional XBRL concepts in tidy format.
+
+All data is synced to cloud backup automatically.
 
 ### Commands
 
@@ -21,7 +26,7 @@ dimensional XBRL concepts in tidy format.
 |---|----------|---------|
 | 1 | stock_notes.validate | Parse and validate command + instructions |
 | 2 | stock_notes.execute | Run the appropriate sub-command |
-| 3 | stock_notes.format | Render results as markdown |
+| 3 | stock_notes.format | Normalize result into response dict |
 
 ### Input Schema
 
@@ -44,7 +49,9 @@ dimensional XBRL concepts in tidy format.
 | `accession_no` | string | required | SEC accession number |
 | `note_number` | integer | null | Specific note to drill into |
 | `ticker` | string | "" | Ticker (auto-detected if empty) |
-| `force_refresh` | boolean | false | Force re-extraction from EDGAR |
+| `refresh` | boolean | false | Force re-extraction from EDGAR (purges local + cloud) |
+
+> **Backward compatibility:** `force_refresh` is accepted as an alias for `refresh`.
 
 #### Details Instructions
 
@@ -68,7 +75,12 @@ dimensional XBRL concepts in tidy format.
    {"command": "note", "instructions": {"accession_no": "0000320193-26-000013", "note_number": 6}}
    ```
 
-3. **Query concept time-series:**
+3. **Force refresh a filing:**
+   ```json
+   {"command": "note", "instructions": {"accession_no": "0000320193-26-000013", "ticker": "AAPL", "refresh": true}}
+   ```
+
+4. **Query concept time-series:**
    ```json
    {"command": "details", "instructions": {"ticker": "AAPL", "concept": "us-gaap:LongTermDebt", "start_date": "2024-09", "end_date": "2026-03"}}
    ```
@@ -76,7 +88,7 @@ dimensional XBRL concepts in tidy format.
 ### Troubleshooting
 
 - **No data found:** Run `note` with the accession number first to hydrate the cache.
-- **Stale data:** Use `force_refresh: true` to re-extract from EDGAR.
+- **Stale data:** Use `refresh: true` to re-extract from EDGAR (purges local + cloud).
 - **Missing concepts:** The footnote may not have been hydrated yet.
 """
 
@@ -84,5 +96,15 @@ TOOL_OUTPUT_EXAMPLE = {
     "command": "discover",
     "ticker": "AAPL",
     "filings_count": 20,
-    "markdown": "# Filings for AAPL (20 found)\n| # | Form | Filing Date | ..."
+    "filings": [
+        {
+            "form": "10-K",
+            "filing_date": "2026-01-15",
+            "period_of_report": "2025-09-28",
+            "quarter": 4,
+            "year": 2025,
+            "quarter_label": "Q4 FY2025",
+            "accession_no": "0000320193-26-000013",
+        }
+    ],
 }

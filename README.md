@@ -101,7 +101,9 @@ activity_server/
 │   ├── textstats/                  #   Text analysis (2 Activities)
 │   ├── db_writer/                  #   Writes output to DB (2 Activities)
 │   ├── artifact_saver/             #   Saves .txt file + DB record (3 Activities)
-│   └── slow_hello/                 #   240s delay — long polling demo (2 Activities)
+│   ├── slow_hello/                 #   240s delay — long polling demo (2 Activities)
+│   ├── stock_financials/           #   SEC EDGAR quarterly financials — income/balance/cashflow (3 Activities)
+│   └── stock_notes/                #   SEC EDGAR filing footnotes — narratives + XBRL details (3 Activities)
 │
 └── data/                           # Auto-created database files + artifacts
     ├── operational.db              #   Turso (pyturso)
@@ -206,6 +208,13 @@ POST /tools/slow_hello?timeout=600
 ### Dual-Write
 Every write goes to Turso (operational) AND Snowflake (cloud). If cloud fails,
 writes are queued and retried with exponential backoff.
+
+All stock_financials and stock_notes tables are cloud-synced:
+- `sf_tickers`, `sf_quarterly_facts` (stock_financials)
+- `sn_filings`, `sn_notes`, `sn_detail_registry`, `sn_note_details` (stock_notes)
+
+Sync is verified on startup only (not shutdown) to prevent faulty runs from
+overwriting healthy cloud data.
 
 ### Auto-Heal Schema
 No migration scripts. The Expected Schema in `db/schema.py` is the single source
