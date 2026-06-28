@@ -297,32 +297,91 @@ class SchemaManager:
         self.tel = tel_conn
         self._sync_ok = True
 
+    @staticmethod
+    def _is_snowflake(conn) -> bool:
+        """Detect if connection is Snowflake (vs Turso/SQLite)."""
+        if conn is None:
+            return False
+        return hasattr(conn, '_conn') and hasattr(conn._conn, 'rest')
+
     def _table_exists(self, conn, name: str) -> bool:
+        if self._is_snowflake(conn):
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_name = %s",
+                (name.upper(),))
+            row = cur.fetchone()
+            return row[0] > 0 if row else False
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
         return cur.fetchone() is not None
 
     def _table_columns(self, conn, table: str) -> List[str]:
+        if self._is_snowflake(conn):
+            cur = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s ORDER BY ordinal_position",
+                (table.upper(),))
+            return [row[0].lower() for row in cur.fetchall()]
         cur = conn.execute(f"PRAGMA table_info({table})")
         return [row[1] for row in cur.fetchall()]
 
     def _count_rows(self, conn, table: str) -> int:
+        if self._is_snowflake(conn):
+            cur = conn.execute(f"SELECT COUNT(*) FROM {table}")
+            row = cur.fetchone()
+            return row[0] if row else 0
         cur = conn.execute(f"SELECT COUNT(*) FROM {table}")
         row = cur.fetchone()
         return row[0] if row else 0
 
     def _create_table(self, conn, tbl_name, expected):
-        cols_sql = ", ".join(f"{c.name} {c.type}" for c in expected.columns)
-        conn.execute(f"CREATE TABLE {tbl_name} ({cols_sql})")
-        conn.commit()
+        if self._is_snowflake(conn):
+            # Snowflake DDL — use Snowflake-compatible types
+            type_map = {
+                "INTEGER PRIMARY KEY": "INTEGER",
+                "TEXT PRIMARY KEY": "TEXT",
+                "INTEGER": "INTEGER",
+                "REAL": "FLOAT",
+                "TEXT": "TEXT",
+            }
+            cols = []
+            pk_col = None
+            for c in expected.columns:
+                sf_type = type_map.get(c.type, "TEXT")
+                cols.append(f"{c.name} {sf_type}")
+                if "PRIMARY KEY" in c.type:
+                    pk_col = c.name
+            if pk_col:
+                cols_sql = ", ".join(cols) + f", PRIMARY KEY ({pk_col})"
+            else:
+                cols_sql = ", ".join(cols)
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {tbl_name} ({cols_sql})")
+            conn.commit()
+        else:
+            cols_sql = ", ".join(f"{c.name} {c.type}" for c in expected.columns)
+            conn.execute(f"CREATE TABLE {tbl_name} ({cols_sql})")
+            conn.commit()
         log.info(f"    Created table: {tbl_name}")
 
     def _add_missing_columns(self, conn, tbl_name, expected, actual_cols, label):
         for col in expected.columns:
             if col.name not in actual_cols:
                 default = "NULL" if col.default == "NULL" else col.default
-                conn.execute(
-                    f"ALTER TABLE {tbl_name} ADD COLUMN {col.name} {col.type} DEFAULT {default}")
+                if self._is_snowflake(conn):
+                    type_map = {
+                        "INTEGER PRIMARY KEY": "INTEGER",
+                        "TEXT PRIMARY KEY": "TEXT",
+                        "INTEGER": "INTEGER",
+                        "REAL": "FLOAT",
+                        "TEXT": "TEXT",
+                    }
+                    sf_type = type_map.get(col.type, "TEXT")
+                    conn.execute(
+                        f"ALTER TABLE {tbl_name} ADD COLUMN {col.name} {sf_type} DEFAULT {default}")
+                else:
+                    conn.execute(
+                        f"ALTER TABLE {tbl_name} ADD COLUMN {col.name} {col.type} DEFAULT {default}")
                 log.info(f"    [{label}] Added column {tbl_name}.{col.name} (default={default})")
 
     def _has_unexpected_columns(self, actual_cols: List[str], expected: TableSchema) -> bool:
@@ -338,12 +397,17 @@ class SchemaManager:
         4. Repopulate from backup (matching columns only)
         5. Compute values for new columns that have compute functions
         """
+        is_sf = self._is_snowflake(conn)
+        ph = "%s" if is_sf else "?"  # parameter placeholder
+
         log.info(f"    [{label}] Rebuilding table {tbl_name} (unexpected columns detected)...")
 
         # 1. Backup
         cur = conn.execute(f"SELECT * FROM {tbl_name}")
         rows = cur.fetchall()
         backup_cols = [d[0] for d in cur.description] if rows else []
+        # Normalize column names to lowercase for consistency
+        backup_cols = [c.lower() for c in backup_cols]
         backup = [dict(zip(backup_cols, row)) for row in rows]
         log.info(f"    [{label}] Backed up {len(backup)} rows from {tbl_name}")
 
@@ -383,7 +447,7 @@ class SchemaManager:
                                 insert_data[col.name] = default
 
             cols_sql = ", ".join(insert_data.keys())
-            placeholders = ", ".join(["?"] * len(insert_data))
+            placeholders = ", ".join([ph] * len(insert_data))
             conn.execute(
                 f"INSERT INTO {tbl_name} ({cols_sql}) VALUES ({placeholders})",
                 list(insert_data.values()))
@@ -405,11 +469,14 @@ class SchemaManager:
                 self._add_missing_columns(conn, tbl_name, expected, actual_cols, "op")
                 conn.commit()
 
-        # Drop unexpected tables
+        # Drop unexpected tables (skip system tables like __turso_internal_*)
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         all_tables = {row[0] for row in cur.fetchall()}
         for tbl in all_tables - set(OPERATIONAL_TABLES.keys()):
+            # Skip Turso internal tables (MVCC metadata, etc.)
+            if tbl.startswith("__turso_internal"):
+                continue
             conn.execute(f"DROP TABLE IF EXISTS {tbl}")
             log.info(f"    [op] Dropped unexpected table: {tbl}")
         conn.commit()

@@ -24,10 +24,9 @@ import aiohttp.web
 from server.accumulator import Accumulator
 from tools import TOOL_REGISTRY
 from db.schema import OPERATIONAL_TABLES, CLOUD_SYNC_TABLES
+from db.config import LONG_POLL_TIMEOUT
 
 log = logging.getLogger("activity-server")
-
-LONG_POLL_TIMEOUT = 3600
 
 
 async def _run_tool(tool, arguments: dict, acc=None):

@@ -4,6 +4,8 @@ Turso operational database connection using pyturso.
 
 Local dev: turso.connect("./data/operational.db")
 Production: turso.sync.connect("./data/operational.db", remote_url="libsql://...", auth_token="...")
+
+Enables WAL mode for MVCC support (required for BEGIN CONCURRENT transactions).
 """
 import logging
 import turso
@@ -33,6 +35,23 @@ class TursoConnection:
             # Local only
             self._conn = turso.connect(TURSO_LOCAL_PATH)
             log.info(f"  Turso connected (local): {TURSO_LOCAL_PATH}")
+
+        # Enable MVCC mode (required for BEGIN CONCURRENT transactions).
+        # pyturso wraps the Turso Database Rust rewrite which supports MVCC.
+        # PRAGMA journal_mode='mvcc' enables concurrent write transactions
+        # with optimistic concurrency control and snapshot isolation.
+        try:
+            cur = self._conn.execute("PRAGMA journal_mode='mvcc'")
+            mode = cur.fetchone()
+            log.info(f"  Turso MVCC mode enabled (journal_mode={mode[0]})")
+        except Exception as e:
+            log.warning(f"  Could not enable MVCC mode: {e}")
+            # Fallback to WAL mode
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                log.info("  Turso WAL mode enabled (fallback)")
+            except Exception as e2:
+                log.warning(f"  Could not enable WAL mode: {e2}")
 
     def close_sync(self):
         if self._conn:

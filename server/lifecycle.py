@@ -46,7 +46,7 @@ class Server:
         self.resolve_source = resolve_source
         self.turso = TursoConnection()
         self.cloud = CloudConnection()
-        self.tel_conn = None  # CloudConnection for telemetry (local file)
+        self.tel_conn = None  # telemetry connection (local Turso)
         self.schema_manager = None
         self.dual_writer = None
         self.tools_locked = True
@@ -56,7 +56,23 @@ class Server:
         self._telemetry_queue = asyncio.Queue()
 
     def startup_sync(self):
-        """Full startup sequence (synchronous — pyturso is sync)."""
+        """Full startup sequence (synchronous).
+
+        8-step startup:
+          [1/8] Opening Snowflake connection (fail-hard if unavailable)
+          [2/8] Opening operational database
+          [3/8] Opening telemetry database
+          [4/8] Validating Operational schemas
+          [5/8] Validating Cloud schemas
+          [6/8] Validating Telemetry schema
+          [7/8] Checking synced tables
+          [8/8] Setting telemetry queue
+
+        Golden rules:
+          - Snowflake connection failure → shutdown (no mock fallback)
+          - Auto-resolve only when one side is truly empty (0 rows)
+          - Hash mismatches with data on both sides → tools LOCKED
+        """
         self.started_at = datetime.now(timezone.utc).isoformat()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         Path(ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)
@@ -65,26 +81,53 @@ class Server:
         log.info("ACTIVITY SERVER — STARTUP")
         log.info("=" * 60)
 
-        # 1. Open databases
-        log.info("[1/7] Opening databases...")
+        # [1/8] Open Snowflake — fail-hard if unavailable
+        log.info("[1/8] Opening Snowflake connection...")
+        try:
+            self.cloud.open_sync()
+        except Exception as e:
+            log.error(f"  FATAL: Snowflake connection failed: {e}")
+            log.error("  Server cannot start without cloud connection.")
+            raise SystemExit(1) from e
+
+        self.schema_manager = SchemaManager(
+            self.turso, self.cloud, None)  # tel_conn set later
+        # Create missing sync tables in cloud first
+        for tbl_name in CLOUD_SYNC_TABLES:
+            expected = OPERATIONAL_TABLES.get(tbl_name)
+            if expected and not self.schema_manager._table_exists(self.cloud, tbl_name):
+                self.schema_manager._create_table(self.cloud, tbl_name, expected)
+        log.info(f"  All {len(CLOUD_SYNC_TABLES)} sync tables verified in Snowflake. ✓")
+
+        # [2/8] Opening operational database...
+        log.info("[2/8] Opening operational database...")
         self.turso.open_sync()
-        self.cloud.open_sync()
+
+        # [3/8] Opening telemetry database...
+        log.info("[3/8] Opening telemetry database...")
         self.tel_conn = CloudConnection()
         import turso as _turso
         self.tel_conn._conn = _turso.connect(TELEMETRY_DB_PATH)
         log.info(f"  Telemetry connected: {TELEMETRY_DB_PATH}")
+        self.schema_manager.tel = self.tel_conn
 
-        # 2. Schema validation & repair
-        log.info("[2/7] Validating schemas...")
-        self.schema_manager = SchemaManager(
-            self.turso, self.cloud, self.tel_conn)
+        # [4/8] Validating Operational schemas FIRST
+        log.info("[4/8] Validating Operational schemas...")
         self.schema_manager.validate_operational()
-        self.schema_manager.validate_cloud()
-        self.schema_manager.validate_telemetry()
-        log.info("  Schema validation complete.")
+        log.info("  Operational schema validation complete.")
 
-        # 3. Sync check — only for cloud-synced tables
-        log.info("[3/7] Checking synced tables ({})...".format(
+        # [5/8] Validating Cloud schemas SECOND
+        log.info("[5/8] Validating Cloud schemas...")
+        self.schema_manager.validate_cloud()
+        log.info("  Cloud schema validation complete.")
+
+        # [6/8] Validating Telemetry schema
+        log.info("[6/8] Validating Telemetry schema...")
+        self.schema_manager.validate_telemetry()
+        log.info("  Telemetry schema validation complete.")
+
+        # [7/8] Checking synced tables
+        log.info("[7/8] Checking synced tables ({})...".format(
             ", ".join(sorted(CLOUD_SYNC_TABLES))))
         sync = self.schema_manager.check_sync()
         for tbl, info in sync.items():
@@ -92,42 +135,76 @@ class Server:
             log.info(f"  {s} {tbl}: op={info['op_count']} cloud={info['cloud_count']} "
                      f"hash_mismatches={info['hash_mismatches']}")
 
-        # 4. Handle out-of-sync
+        # Handle out-of-sync — golden rules:
+        #   - Auto-resolve ONLY when one side is truly empty (0 rows)
+        #   - Both sides have data but mismatched → tools LOCKED
         if not self.schema_manager.in_sync:
-            if self.resolve_source:
-                log.warning(f"  Out of sync — auto-resolving with {self.resolve_source}")
+            can_auto_resolve = self._can_auto_resolve(sync)
+            if can_auto_resolve and self.resolve_source:
+                log.warning(f"  One side empty — auto-resolving with {self.resolve_source}")
                 self.resolve_sync(self.resolve_source)
+            elif can_auto_resolve:
+                # Determine which side to use automatically
+                empty_side = self._find_empty_side(sync)
+                auto_source = "cloud" if empty_side == "operational" else "operational"
+                log.warning(f"  One side empty — auto-resolving with {auto_source}")
+                self.resolve_sync(auto_source)
             else:
-                log.warning("  ⚠ SYNCED TABLES OUT OF SYNC — DEGRADED MODE")
-                log.warning("  Server is running but tools are LOCKED.")
-                log.warning("  Resolve by POST /resolve {\"source\":\"operational\"} "
+                log.error("  ⚠ SYNCED TABLES OUT OF SYNC — DATA MISMATCH")
+                log.error("  Both operational and cloud have data but they differ.")
+                log.error("  Server is running but tools are LOCKED.")
+                log.error("  Resolve manually: POST /resolve {\"source\":\"operational\"} "
                             "or {\"source\":\"cloud\"}")
                 self.tools_locked = True
         else:
             self.tools_locked = False
             log.info("  Synced tables in sync. ✓")
 
-        # 5. Set telemetry queue
+        # [8/8] Set telemetry queue
+        log.info("[8/8] Setting telemetry queue...")
         set_telemetry_queue(self._telemetry_queue)
+
+    @staticmethod
+    def _can_auto_resolve(sync: dict) -> bool:
+        """Auto-resolve is allowed only when at least one table has one side empty.
+
+        Returns True if ANY synced table has op_count==0 or cloud_count==0.
+        Returns False if all out-of-sync tables have data on BOTH sides.
+        """
+        for tbl, info in sync.items():
+            if not info["match"] and (info["op_count"] == 0 or info["cloud_count"] == 0):
+                return True
+        return False
+
+    @staticmethod
+    def _find_empty_side(sync: dict) -> str:
+        """Determine which side is empty for auto-resolve.
+
+        Returns 'operational' if operational is empty, 'cloud' otherwise.
+        """
+        for tbl, info in sync.items():
+            if not info["match"] and info["op_count"] == 0:
+                return "operational"
+        return "cloud"
 
     async def post_startup(self):
         """Async post-startup: register tools, start background tasks."""
         from tools import TOOL_REGISTRY
         self.tool_registry = TOOL_REGISTRY
 
-        log.info("[4/7] Registering tools...")
+        log.info("[post] Registering tools...")
         self._register_tools()
 
-        log.info("[5/7] Starting background tasks...")
+        log.info("[post] Starting background tasks...")
         self.dual_writer = DualWriter(self.turso, self.cloud)
         await self.dual_writer.start()
         self._telemetry_task = asyncio.create_task(
             _telemetry_drain(self.tel_conn, self._telemetry_queue))
 
-        log.info("[6/7] Tool inventory:")
+        log.info("[post] Tool inventory:")
         for name, tool in self.tool_registry.items():
             log.info(f"  • {name}: {tool.description[:60]}")
-        log.info(f"[7/7] {len(self.tool_registry)} tools registered.")
+        log.info(f"[post] {len(self.tool_registry)} tools registered.")
 
         log.info("=" * 60)
         log.info(f"Server ready. Tools {'LOCKED' if self.tools_locked else 'ACTIVE'}.")
@@ -149,10 +226,13 @@ class Server:
 
         Only affects cloud-synced tables. After resolution, tools are unlocked.
         """
+        from db.schema import SchemaManager
+
         src = self.turso if source == "operational" else self.cloud
         dst = self.cloud if source == "operational" else self.turso
+        ph = "%s" if SchemaManager._is_snowflake(dst) else "?"
+
         for tbl_name in CLOUD_SYNC_TABLES:
-            expected = OPERATIONAL_TABLES[tbl_name]
             src_cols = self.schema_manager._table_columns(src, tbl_name)
             dst_cols = self.schema_manager._table_columns(dst, tbl_name)
             common = [c for c in src_cols if c in dst_cols]
@@ -163,9 +243,9 @@ class Server:
             rows = cur.fetchall()
             dst.execute(f"DELETE FROM {tbl_name}")
             for row in rows:
-                ph = ", ".join(["?"] * len(row))
+                placeholders = ", ".join([ph] * len(row))
                 dst.execute(
-                    f"INSERT INTO {tbl_name} ({col_list}) VALUES ({ph})", list(row))
+                    f"INSERT INTO {tbl_name} ({col_list}) VALUES ({placeholders})", list(row))
             dst.commit()
         self.tools_locked = False
         log.info(f"  Resolved using {source}. Tools unlocked.")

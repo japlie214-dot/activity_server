@@ -250,8 +250,8 @@ On every startup, `SchemaManager` compares the actual database state against it:
 |---|---|---|
 | Missing table | Create it | Create it (synced tables only) |
 | Missing column | Add with default value | Add with default value |
-| Unexpected column | **Rebuild table** | **Rebuild table** |
-| Unexpected table | **Drop it** | **Leave it** (other systems may own it) |
+| Unexpected column | **Rebuild table** (backup → drop → recreate → repopulate) | **Rebuild table** (repopulate from Operational) |
+| Unexpected table | **Drop it** | **Ignore it** (other systems may own it) |
 
 ## DualWriter — Write Patterns
 
@@ -266,9 +266,25 @@ The `DualWriter` supports three write patterns for cloud-synced tables:
 
 All methods automatically:
 - Compute `row_hash` for synced tables
-- Write to operational (Turso) first
+- Write to operational (Turso) first, using `BEGIN CONCURRENT` (with `BEGIN IMMEDIATE` fallback)
 - Write to cloud (Snowflake) second
 - Queue failed cloud writes for retry with exponential backoff
+
+### Concurrent Transactions
+
+Write transactions on Turso use `BEGIN CONCURRENT` for maximum concurrency.
+
+pyturso wraps the **Turso Database Rust rewrite** (not libSQL), which natively
+supports MVCC (Multi-Version Concurrency Control). The database is opened with
+`PRAGMA journal_mode='mvcc'` to enable concurrent write transactions.
+
+`BEGIN CONCURRENT` allows multiple write transactions to proceed simultaneously
+using optimistic concurrency control with snapshot isolation. Conflict detection
+happens at commit time (row-level). If a write-write conflict is detected, the
+transaction receives `SQLITE_BUSY` and must be retried.
+
+See the [Turso manual](https://github.com/tursodatabase/turso/blob/main/docs/manual.md)
+for the full concurrent transaction lifecycle.
 
 ### Sync Verification
 

@@ -115,6 +115,7 @@ activity_server/
 ## Quick Start
 
 ```bash
+cp .env.example .env   # Edit as needed
 pip install -r requirements.txt
 python run.py --port 8080
 ```
@@ -126,6 +127,21 @@ python run.py --port 8080
 TURSO_URL=https://your-db.your-region.turso.io
 TURSO_AUTH_TOKEN=your-token-here
 ```
+
+### Configuration
+
+All settings are configurable via environment variables. See `.env.example`
+for the full list. Key settings:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURSO_URL` | (empty) | Remote Turso URL. Empty = local only |
+| `TURSO_AUTH_TOKEN` | (empty) | Auth token for remote Turso |
+| `LONG_POLL_TIMEOUT` | `3600` | Max tool timeout in seconds |
+| `CLOUD_RETRY_ATTEMPTS` | `5` | Max retry attempts for cloud writes |
+| `CLOUD_RETRY_BASE_WAIT` | `1.0` | Base wait time (seconds) for exponential backoff |
+| `CONTENT_PREVIEW_LENGTH` | `200` | Max chars for artifact content preview |
+| `SCHEMA_BACKUP_SUFFIX` | `_backup` | Suffix for backup tables during rebuild |
 
 ## API Endpoints
 
@@ -208,6 +224,12 @@ POST /tools/slow_hello?timeout=600
 ### Dual-Write
 Every write goes to Turso (operational) AND Snowflake (cloud). If cloud fails,
 writes are queued and retried with exponential backoff.
+
+Write transactions on Turso use `BEGIN CONCURRENT` for maximum concurrency.
+pyturso wraps the Turso Database Rust rewrite which natively supports MVCC
+(Multi-Version Concurrency Control). The database is opened with
+`PRAGMA journal_mode='mvcc'` to enable concurrent write transactions with
+optimistic concurrency control and snapshot isolation.
 
 All stock_financials and stock_notes tables are cloud-synced:
 - `sf_tickers`, `sf_quarterly_facts` (stock_financials)

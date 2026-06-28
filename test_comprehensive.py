@@ -50,7 +50,7 @@ def _start_server():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    deadline = time.time() + 15
+    deadline = time.time() + 90
     while time.time() < deadline:
         try:
             r = requests.get(f"{BASE}/health", timeout=1)
@@ -59,7 +59,7 @@ def _start_server():
         except Exception:
             time.sleep(0.3)
     _proc.kill()
-    raise RuntimeError("Server failed to start within 15s")
+    raise RuntimeError("Server failed to start within 90s")
 
 
 def _stop_server():
