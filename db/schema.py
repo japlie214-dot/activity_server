@@ -69,15 +69,16 @@ class TableSchema:
 def _compute_row_hash(row_data: dict) -> str:
     """Compute a SHA-256 hash of row data for sync verification.
 
-    Excludes 'id' and 'row_hash'. Column values are sorted alphabetically
-    by name and concatenated as "name=value;" pairs.
+    Excludes 'id' and 'row_hash'. Column names are normalized to lowercase
+    before hashing so Turso (lowercase) and Snowflake (UPPERCASE) produce
+    identical hashes for identical data.
     """
     exclude = {"id", "row_hash"}
     pairs = []
     for key in sorted(row_data.keys()):
-        if key in exclude:
+        if key.lower() in exclude:
             continue
-        pairs.append(f"{key}={row_data[key]}")
+        pairs.append(f"{key.lower()}={row_data[key]}")
     content = ";".join(pairs)
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -503,6 +504,19 @@ class SchemaManager:
             if not self._table_exists(conn, tbl_name):
                 self._create_table(conn, tbl_name, expected)
 
+    # Natural key columns for each synced table.
+    # Used by check_sync() to compare rows across databases,
+    # since auto-increment 'id' may differ between Turso and Snowflake.
+    NATURAL_KEYS = {
+        "sf_quarterly_facts": ["ticker", "statement_type", "concept", "quarter"],
+        "sf_tickers":         ["ticker"],
+        "sn_filings":         ["filing_id"],
+        "sn_notes":           ["note_id"],
+        "sn_note_details":    ["detail_id"],
+        "sn_detail_registry": ["registry_id"],
+        "artifacts":          ["tool_name", "filename", "created_at"],
+    }
+
     def _get_pk_column(self, tbl_name: str) -> str:
         """Get the primary key column name for a table from the expected schema."""
         expected = OPERATIONAL_TABLES.get(tbl_name)
@@ -514,6 +528,9 @@ class SchemaManager:
 
     def check_sync(self) -> dict:
         """Check sync status for cloud-synced tables using row hashes.
+
+        Uses natural key columns (not auto-increment 'id') for comparison,
+        since 'id' values may differ between Turso and Snowflake.
 
         Returns a dict keyed by table name with:
           op_count, cloud_count, match (bool), hash_mismatches (int)
@@ -527,31 +544,32 @@ class SchemaManager:
                     "match": False, "hash_mismatches": 0}
                 continue
 
-            pk = self._get_pk_column(tbl_name)
+            natural_key = self.NATURAL_KEYS.get(tbl_name, ["id"])
+            nk_select = ", ".join(natural_key)
             op_n = self._count_rows(self.turso, tbl_name)
             cloud_n = self._count_rows(self.cloud, tbl_name)
 
-            # Compare hashes using the correct PK column
+            # Build op hash map keyed by natural key tuple
             op_hashes = {}
-            cur = self.turso.execute(f"SELECT {pk}, row_hash FROM {tbl_name}")
+            cur = self.turso.execute(f"SELECT {nk_select}, row_hash FROM {tbl_name}")
             for row in cur.fetchall():
-                op_hashes[row[0]] = row[1]
+                nk = tuple(row[:-1])
+                op_hashes[nk] = row[-1]
 
             hash_mismatches = 0
-            cur = self.cloud.execute(f"SELECT {pk}, row_hash FROM {tbl_name}")
+            cloud_nks = set()
+            cur = self.cloud.execute(f"SELECT {nk_select}, row_hash FROM {tbl_name}")
             for row in cur.fetchall():
-                cid, chash = row[0], row[1]
-                if cid not in op_hashes:
+                nk = tuple(row[:-1])
+                cloud_nks.add(nk)
+                chash = row[-1]
+                if nk not in op_hashes:
                     hash_mismatches += 1
-                elif op_hashes[cid] != chash:
+                elif op_hashes[nk] != chash:
                     hash_mismatches += 1
             # Rows in op but not in cloud
-            cloud_ids = set()
-            cur = self.cloud.execute(f"SELECT {pk} FROM {tbl_name}")
-            for row in cur.fetchall():
-                cloud_ids.add(row[0])
-            for oid in op_hashes:
-                if oid not in cloud_ids:
+            for nk in op_hashes:
+                if nk not in cloud_nks:
                     hash_mismatches += 1
 
             match = (op_n == cloud_n) and (hash_mismatches == 0)

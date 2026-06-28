@@ -33,25 +33,8 @@ _CURRENCY_SYMBOLS = {
     "CNY": "¥", "KRW": "₩", "INR": "₹", "AUD": "A$", "CAD": "C$",
     "CHF": "CHF", "SGD": "S$", "HKD": "HK$",
 }
-KEY_CONCEPTS = {
-    "income": {
-        "us-gaap:Revenues": "Revenue",
-        "us-gaap:GrossProfit": "Gross Profit",
-        "us-gaap:OperatingIncomeLoss": "Operating Income",
-        "us-gaap:NetIncomeLoss": "Net Income",
-        "us-gaap:EarningsPerShareBasic": "EPS (Basic)",
-    },
-    "balance": {
-        "us-gaap:Assets": "Total Assets",
-        "us-gaap:Liabilities": "Total Liabilities",
-        "us-gaap:StockholdersEquity": "Stockholders' Equity",
-        "us-gaap:CashAndCashEquivalentsAtCarryingValue": "Cash & Equivalents",
-    },
-    "cashflow": {
-        "us-gaap:NetCashProvidedByUsedInOperatingActivities": "Operating CF",
-        "us-gaap:NetCashProvidedByUsedInInvestingActivities": "Investing CF",
-    },
-}
+# Key concepts for summary display are derived dynamically from the blueprint.
+# See _build_key_metrics() which uses is_total=True rows from the blueprint.
 SUMMARY_QUARTERS_SHOWN = 4
 
 
@@ -207,14 +190,6 @@ def _do_extract(ticker: str, inst: dict) -> dict:
     cache_hit = existing[0] >= quarters and not refresh
 
     if not cache_hit:
-        if refresh:
-            # Delete from both local and cloud via dual writer
-            dw = _get_dual_writer()
-            if dw:
-                dw.delete("sf_quarterly_facts", "WHERE ticker = ?", (ticker,))
-            else:
-                conn.execute("DELETE FROM sf_quarterly_facts WHERE ticker = ?", (ticker,))
-                conn.commit()
         result = extract_and_persist(ticker, quarters, refresh)
     else:
         result = {
@@ -246,6 +221,7 @@ def _do_extract(ticker: str, inst: dict) -> dict:
         "cache_hit": cache_hit,
         "refresh": refresh,
         "total_rows": len(rows),
+        "persisted": result.get("persisted", {}),
         "coverage": coverage,
         "key_metrics": key_metrics,
     }
@@ -427,14 +403,15 @@ def _build_coverage(rows: List[dict]) -> dict:
 
 
 def _build_key_metrics(rows: List[dict]) -> dict:
-    """Build key metrics pivot per statement type."""
+    """Build key metrics pivot per statement type.
+
+    Dynamically selects key metrics from rows where is_total=True
+    (totals/subtotals from the statement blueprint). No hardcoded concept lists.
+    """
     key_metrics = {}
     for stype in ("income", "balance", "cashflow"):
         st_rows = [r for r in rows if r.get("statement_type") == stype]
         if not st_rows:
-            continue
-        metrics = KEY_CONCEPTS.get(stype, {})
-        if not metrics:
             continue
         all_qs = sorted({r["quarter"] for r in st_rows}, reverse=True)[
             :SUMMARY_QUARTERS_SHOWN
@@ -442,11 +419,25 @@ def _build_key_metrics(rows: List[dict]) -> dict:
         if not all_qs:
             continue
 
+        # Use is_total rows from the blueprint as key metrics
+        total_rows = [r for r in st_rows if r.get("is_total")]
+        if not total_rows:
+            # Fallback: use rows with depth <= 1 (top-level items)
+            total_rows = [r for r in st_rows if r.get("depth", 0) <= 1]
+
+        # Get unique concepts, preserving order
+        seen_concepts = []
+        for r in total_rows:
+            c = r.get("concept")
+            if c and c not in seen_concepts:
+                seen_concepts.append(c)
+
         type_metrics = {}
-        for concept_full, label in metrics.items():
-            c_data = [r for r in st_rows if r.get("concept") == concept_full]
+        for concept_full in seen_concepts:
+            c_data = [r for r in st_rows if r.get("concept") == concept_full and r["quarter"] in all_qs]
             if not c_data:
                 continue
+            label = c_data[0].get("label", concept_full.split(":")[-1])
             unit_val = c_data[0].get("unit", "USD")
             qd = {r["quarter"]: r.get("numeric_value") for r in c_data}
             type_metrics[concept_full] = {

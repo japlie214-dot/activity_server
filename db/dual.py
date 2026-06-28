@@ -109,13 +109,35 @@ def _insert_or_replace(conn, table: str, data: dict) -> None:
 
 
 class DualWriter:
-    """Write-through to Turso, then Cloud (for synced tables only)."""
+    """Write-through to Turso, then Cloud (for synced tables only).
+
+    All writes to cloud-synced tables MUST go through this class.
+    Direct conn.execute() on synced tables is a bug — it bypasses
+    cloud replication and row_hash computation.
+    """
 
     def __init__(self, turso_conn, cloud_conn):
         self.turso = turso_conn
         self.cloud = cloud_conn
         self._pending: asyncio.Queue = asyncio.Queue()
         self._retry_task: asyncio.Task = None
+        self._enforce_mode = True  # When True, block raw writes to synced tables
+
+    @staticmethod
+    def is_synced_table(table: str) -> bool:
+        """Check if a table requires DualWriter."""
+        return table in CLOUD_SYNC_TABLES
+
+    def assert_not_synced(self, table: str, caller: str = ""):
+        """Raise if someone tries to write to a synced table outside DualWriter.
+
+        Call this from conn.execute() wrappers or guards to catch violations.
+        """
+        if self._enforce_mode and self.is_synced_table(table):
+            raise RuntimeError(
+                f"ILLEGAL WRITE: '{table}' is a cloud-synced table. "
+                f"All writes must go through DualWriter (write/upsert/delete). "
+                f"Caller: {caller or 'unknown'}")
 
     async def start(self):
         self._retry_task = asyncio.create_task(self._retry_loop())

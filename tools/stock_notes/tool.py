@@ -7,6 +7,8 @@ Activities:
   3. stock_notes.format   — Normalize result into response dict
 """
 import json
+import hashlib
+from datetime import datetime, timezone
 from typing import Any
 
 from tools import Tool
@@ -89,7 +91,9 @@ def format_result(acc, result: Any, validated: dict) -> dict:
 def _do_discover(inst: dict) -> dict:
     """Find and list recent filings for a ticker.
 
-    Returns structured JSON with filing metadata (no markdown).
+    Always calls EDGAR to get the latest filings, then merges into sn_filings
+    so the `note` command benefits from the cache. SEC filings are immutable
+    once filed — merging is safe (INSERT OR IGNORE skips duplicates).
     """
     from .extractor import discover_filings
 
@@ -99,12 +103,57 @@ def _do_discover(inst: dict) -> dict:
 
     forms = inst.get("forms", "10-K,10-Q")
     form_types = [f.strip() for f in forms.split(",") if f.strip()]
+
+    # Always call EDGAR for discover
     filings = discover_filings(ticker, form_types=form_types, limit=40)
 
     if not filings:
         return {"error": f"No filings found for {ticker}. Verify the ticker."}
 
-    # Build structured filing list
+    # Merge discovered filings into sn_filings for caching
+    conn = _get_conn()
+    dw = None
+    try:
+        from server.app import get_server
+        server = get_server()
+        if server:
+            dw = server.dual_writer
+    except Exception:
+        pass
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for f in filings:
+        filing_id = f"{ticker}|{f['form']}|{f['accession_no']}"
+        filing_data = {
+            "filing_id": filing_id,
+            "ticker": ticker,
+            "form": f["form"],
+            "filing_date": f["filing_date"],
+            "accession_no": f["accession_no"],
+            "period_of_report": f.get("period_of_report", ""),
+            "company_name": f.get("company_name", ""),
+            "cik": str(f.get("cik", "")),
+            "fiscal_year_end_month": f.get("fiscal_year_end_month", 12),
+            "quarter": f.get("quarter", 0),
+            "year": f.get("year", 0),
+            "content_hash": hashlib.md5(filing_id.encode()).hexdigest(),
+            "updated_at": now_iso,
+        }
+        if dw:
+            dw.upsert("sn_filings", filing_data)
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO sn_filings "
+                "(filing_id, ticker, form, filing_date, accession_no, period_of_report, "
+                "company_name, cik, fiscal_year_end_month, quarter, year, content_hash, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (filing_id, ticker, f["form"], f["filing_date"], f["accession_no"],
+                 f.get("period_of_report", ""), f.get("company_name", ""),
+                 str(f.get("cik", "")), f.get("fiscal_year_end_month", 12),
+                 f.get("quarter", 0), f.get("year", 0),
+                 hashlib.md5(filing_id.encode()).hexdigest(), now_iso))
+    conn.commit()
+
     filing_list = []
     for f in filings:
         q_str = f"Q{f['quarter']} FY{f['year']}" if f.get("quarter") else None
@@ -156,13 +205,13 @@ def _do_note(inst: dict) -> dict:
             accession_no, ticker=ticker, force_refresh=refresh
         )
 
-    # Auto-hydrate specific note if missing
-    if note_number is not None:
-        note_exists = conn.execute(
-            "SELECT 1 FROM sn_notes WHERE accession_no=? AND note_number=? LIMIT 1",
-            (accession_no, note_number),
+    # Auto-hydrate if notes are missing (filing exists but notes not extracted yet)
+    if not refresh:
+        notes_exist = conn.execute(
+            "SELECT 1 FROM sn_notes WHERE accession_no=? LIMIT 1",
+            (accession_no,),
         ).fetchone()
-        if not note_exists and not refresh:
+        if not notes_exist:
             extract_and_persist_filing(
                 accession_no, ticker=ticker, force_refresh=False
             )

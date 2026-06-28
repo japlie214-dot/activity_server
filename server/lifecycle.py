@@ -139,19 +139,35 @@ class Server:
         #   - Auto-resolve ONLY when one side is truly empty (0 rows)
         #   - Both sides have data but mismatched → tools LOCKED
         if not self.schema_manager.in_sync:
+            # Build detailed out-of-sync report
+            out_of_sync = {tbl: info for tbl, info in sync.items() if not info["match"]}
+            empty_tables = {tbl: info for tbl, info in out_of_sync.items()
+                           if info["op_count"] == 0 or info["cloud_count"] == 0}
+            mismatch_tables = {tbl: info for tbl, info in out_of_sync.items()
+                               if tbl not in empty_tables}
+
+            if empty_tables:
+                empty_names = ", ".join(sorted(empty_tables.keys()))
+                log.warning(f"  Tables with empty side: {empty_names}")
+            if mismatch_tables:
+                mismatch_detail = ", ".join(
+                    f"{tbl}(op={info['op_count']},cloud={info['cloud_count']},mismatches={info['hash_mismatches']})"
+                    for tbl, info in sorted(mismatch_tables.items()))
+                log.warning(f"  Tables with hash mismatches: {mismatch_detail}")
+
             can_auto_resolve = self._can_auto_resolve(sync)
             if can_auto_resolve and self.resolve_source:
-                log.warning(f"  One side empty — auto-resolving with {self.resolve_source}")
+                log.warning(f"  Auto-resolving with {self.resolve_source} (tables: {empty_names})")
                 self.resolve_sync(self.resolve_source)
             elif can_auto_resolve:
-                # Determine which side to use automatically
                 empty_side = self._find_empty_side(sync)
                 auto_source = "cloud" if empty_side == "operational" else "operational"
-                log.warning(f"  One side empty — auto-resolving with {auto_source}")
+                log.warning(f"  Auto-resolving with {auto_source} (tables: {empty_names})")
                 self.resolve_sync(auto_source)
             else:
                 log.error("  ⚠ SYNCED TABLES OUT OF SYNC — DATA MISMATCH")
-                log.error("  Both operational and cloud have data but they differ.")
+                log.error("  Both operational and cloud have data but row hashes differ.")
+                log.error(f"  Affected tables: {', '.join(sorted(mismatch_tables.keys()))}")
                 log.error("  Server is running but tools are LOCKED.")
                 log.error("  Resolve manually: POST /resolve {\"source\":\"operational\"} "
                             "or {\"source\":\"cloud\"}")
@@ -221,16 +237,28 @@ class Server:
                 (name, tool.description, schema_json, now))
         self.turso.commit()
 
+    def assert_dual_write(self, table: str, caller: str = ""):
+        """Guard: raise if a synced table is being written outside DualWriter.
+
+        Tools should call this before any raw conn.execute() on user-data tables.
+        """
+        if self.dual_writer and self.dual_writer.is_synced_table(table):
+            raise RuntimeError(
+                f"ILLEGAL WRITE: '{table}' is cloud-synced. "
+                f"Use DualWriter.write/upsert/delete. Caller: {caller or 'unknown'}")
+
     def resolve_sync(self, source):
         """Resolve sync conflict by copying all data from source to destination.
 
         Only affects cloud-synced tables. After resolution, tools are unlocked.
+        Uses batched inserts for performance on Snowflake.
         """
         from db.schema import SchemaManager
 
         src = self.turso if source == "operational" else self.cloud
         dst = self.cloud if source == "operational" else self.turso
         ph = "%s" if SchemaManager._is_snowflake(dst) else "?"
+        is_sf = SchemaManager._is_snowflake(dst)
 
         for tbl_name in CLOUD_SYNC_TABLES:
             src_cols = self.schema_manager._table_columns(src, tbl_name)
@@ -241,12 +269,23 @@ class Server:
             col_list = ", ".join(common)
             cur = src.execute(f"SELECT {col_list} FROM {tbl_name}")
             rows = cur.fetchall()
+            if not rows:
+                continue
+
             dst.execute(f"DELETE FROM {tbl_name}")
-            for row in rows:
-                placeholders = ", ".join([ph] * len(row))
-                dst.execute(
-                    f"INSERT INTO {tbl_name} ({col_list}) VALUES ({placeholders})", list(row))
             dst.commit()
+
+            # Batch insert — 100 rows at a time for Snowflake performance
+            batch_size = 100 if is_sf else 500
+            placeholders = ", ".join([ph] * len(common))
+            insert_sql = f"INSERT INTO {tbl_name} ({col_list}) VALUES ({placeholders})"
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                for row in batch:
+                    dst.execute(insert_sql, list(row))
+                dst.commit()
+            log.info(f"    [{source}] Synced {tbl_name}: {len(rows)} rows")
+
         self.tools_locked = False
         log.info(f"  Resolved using {source}. Tools unlocked.")
 
